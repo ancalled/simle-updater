@@ -11,6 +11,7 @@ import org.apache.http.params.HttpConnectionParams;
 import org.apache.http.params.HttpParams;
 import org.apache.http.util.EntityUtils;
 import org.apache.log4j.Logger;
+import org.apache.log4j.xml.DOMConfigurator;
 
 import javax.net.ssl.KeyManagerFactory;
 import java.io.*;
@@ -22,7 +23,6 @@ import java.security.cert.CertificateException;
 import java.text.DecimalFormat;
 import java.text.NumberFormat;
 import java.util.*;
-import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 public class Updater {
@@ -41,13 +41,11 @@ public class Updater {
     public static final String UPDATE_SERVER_SCHEME = "update.server.scheme";
     public static final String UPDATE_SERVER_HOST = "update.server.host";
     public static final String UPDATE_SERVER_PORT = "update.server.port";
-    public static final String UPDATE_LEVEL = "update.level";
-    public static final String TERMINAL_PATH = "update.path";
-    public static final String APPLICATION_HOME = "application.home";
+    public static final String CONTEXT_PATH = "update.path";
     public static final String KEYSTORE_PATH = "keystore.path";
     public static final String KEYSTORE_PASSWORD = "keystore.pwd";
-    public static final String IGNORE_VER = "ignore.version";
-    public static final String APP_JAR_PATH = "app.jar.path";
+    public static final String APP_HOME = "app.home";
+    public static final String APP_JAR = "app.jar";
 
     public static enum UpdateLevel {
         MAJOR, MINOR, TEST;
@@ -69,7 +67,6 @@ public class Updater {
 
     public final int currentVersion;
     private int lastVersion;
-    private int ignoreVersion;
 
     private final String scheme;
     private final String host;
@@ -77,29 +74,18 @@ public class Updater {
 
     private final String keyStorePath;
     private final String keyStorePwd;
-    public final String terminalFolderPh;
-    public final String lastBuildsInfoPh;
+    public final String contextPath;
+    public final String lastBuildsInfo;
 
     public Updater(Properties props, UpdateLevel level) {
         scheme = props.getProperty(UPDATE_SERVER_SCHEME);
         host = props.getProperty(UPDATE_SERVER_HOST);
-        port = Integer.parseInt(props.getProperty(UPDATE_SERVER_PORT, "80"));
+        String portStr = props.getProperty(UPDATE_SERVER_PORT);
+        port = portStr != null ? Integer.parseInt(portStr) : null;
+        contextPath = props.getProperty(CONTEXT_PATH);
 
-        terminalFolderPh = "/" + props.getProperty(TERMINAL_PATH);
-        lastBuildsInfoPh = terminalFolderPh + "/last-build";
+        lastBuildsInfo = contextPath + "/last-build";
 
-        String appJarPath = props.getProperty(APP_JAR_PATH);
-        String ignoreVersionStr = props.getProperty(IGNORE_VER, "0");
-
-        ignoreVersion = Integer.parseInt(ignoreVersionStr);
-
-        if (level == null) {
-            String lvlStr = props.getProperty(UPDATE_LEVEL);
-            level = UpdateLevel.getLevel(lvlStr);
-            if (level == null) {
-                level = UpdateLevel.MINOR;
-            }
-        }
 
         File tempFolder = new File(TEMPORAL_FOLDER);
         if (!tempFolder.exists()) {
@@ -108,10 +94,10 @@ public class Updater {
 
         clearTempDir(tempFolder);
 
+        String applicationHome = props.getProperty(APP_HOME, USER_DIR);
+        String appJar = props.getProperty(APP_JAR);
 
-        String applicationHome = props.getProperty(APPLICATION_HOME, USER_DIR);
-
-        currentVersion = Version.getVersion(appJarPath).getBuildNumber();
+        currentVersion = Version.getVersion(applicationHome + "/" + appJar).getBuildNumber();
 
         keyStorePath = props.getProperty(KEYSTORE_PATH);
         keyStorePwd = props.getProperty(KEYSTORE_PASSWORD);
@@ -162,7 +148,7 @@ public class Updater {
 
         try {
             HttpResponse response = client.execute(new HttpGet(
-                    encode(scheme, host, port, lastBuildsInfoPh)));
+                    encode(scheme, host, port, lastBuildsInfo)));
 
             if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
                 String verStr = EntityUtils.toString(response.getEntity());
@@ -177,7 +163,7 @@ public class Updater {
         } finally {
             client.getConnectionManager().shutdown();
         }
-        return currentVersion < lastVersion && lastVersion != ignoreVersion;
+        return currentVersion < lastVersion;
     }
 
     private void harvestChanges() {
@@ -188,15 +174,15 @@ public class Updater {
             //calculating changes between current and last versions
             for (int ver = currentVersion + 1; ver <= lastVersion; ver++) {
 
-                String verPath = terminalFolderPh + "/" + ver;
+                String verPath = contextPath + "/" + ver;
                 String changesPath = verPath + "/changes";
 
                 log.debug("Got change " + changesPath);
 
                 String content = callResource(changesPath);
                 if (content != null) {
-                    Map<String,String> changeMap = Arrays.stream(content.split("\\n"))
-                            .filter(ch -> ch.startsWith("./") && ch.length() > 1)
+                    Map<String, String> changeMap = Arrays.stream(content.split("\\n"))
+//                            .filter(ch -> ch.startsWith("./") && ch.length() > 1)
                             .map(ch -> ch.substring(2, ch.length()))
                             .collect(Collectors.toMap(c -> c, c -> verPath + "/" + c));
 
@@ -230,31 +216,23 @@ public class Updater {
     }
 
     private void downloadChanges() {
-//        final LoadingForm lf = new LoadingForm();
 
-        Executors.newSingleThreadExecutor().execute(() -> {
+        Set<String> keys = changes.keySet();
 
-            Set<String> keys = changes.keySet();
+        for (String key : keys) {
+            String path = changes.get(key);
+            String filename = TEMPORAL_FOLDER + File.separator + key;
 
-            for (String key : keys) {
-                String path = changes.get(key);
-                String filename = TEMPORAL_FOLDER + File.separator + key;
+            log.info("Downloading " + path + "...");
+            long startTime = System.currentTimeMillis();
 
-                log.info("Downloading " + path + "...");
-                long startTime = System.currentTimeMillis();
+            int bytes = downloadResource(path, filename);
 
-                int bytes = downloadResource(path, filename);
+            long endTime = System.currentTimeMillis();
+            long processTime = endTime - startTime;
 
-                long endTime = System.currentTimeMillis();
-                long processTime = endTime - startTime;
-
-                log.info("Ok. Got " + format.format(bytes) + " bytes in " + format.format(processTime) + " milis");
-            }
-
-//            Platform.runLater(() -> lf.closeMe());
-        });
-
-//        lf.showMe();
+            log.info("Ok. Got " + format.format(bytes) + " bytes in " + format.format(processTime) + " milis");
+        }
 
     }
 
@@ -430,12 +408,13 @@ public class Updater {
         Properties props = new Properties();
         loadProperties(props, configFile);
 
-//        DOMConfigurator.configure(props.getProperty(LOG4J_CONFIG, DEFAULT_LOG4J));
+        DOMConfigurator.configure("log4j.xml");
 
-        Updater updater = new Updater(props, null);
-        updater.checkNewVersions();
-        updater.harvestChanges();
-        updater.downloadChanges();
+        Updater updater = new Updater(props, UpdateLevel.MINOR);
+        if (updater.checkNewVersions()) {
+            updater.harvestChanges();
+            updater.downloadChanges();
+        }
 
     }
 
